@@ -11,7 +11,7 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 
-/** Custom-drawn keyboard. Single touch only (stage 1). */
+/** Custom-drawn keyboard. Single touch only. Keys can vanish briefly after a press. */
 class KeyboardView(context: Context) : View(context) {
 
     interface Listener {
@@ -31,12 +31,19 @@ class KeyboardView(context: Context) : View(context) {
     var enterLabel = "\u23CE"
         set(value) { field = value; invalidate() }
 
-    private class Slot(val key: Key, val rect: RectF)
+    private class Slot(val key: Key, val rect: RectF) {
+        var hideStart = 0L
+        var holdMs = 0L
+    }
 
     private var rows: List<List<Key>> = emptyList()
     private var slots: List<Slot> = emptyList()
     private var pressed: Slot? = null
     private var lastShiftTap = 0L
+
+    private val prefs = context.getSharedPreferences("nexa_prefs", Context.MODE_PRIVATE)
+    private val outMs = 150L
+    private val inMs = 150L
 
     private val d = resources.displayMetrics.density
     private val keyH = 50f * d
@@ -103,9 +110,38 @@ class KeyboardView(context: Context) : View(context) {
         else -> key.label
     }
 
+    /** 1 = fully visible, 0 = fully vanished */
+    private fun visibility(s: Slot, now: Long): Float {
+        if (s.hideStart == 0L) return 1f
+        val t = now - s.hideStart
+        return when {
+            t < 0 -> 1f
+            t < outMs -> 1f - t / outMs.toFloat()
+            t < outMs + s.holdMs -> 0f
+            t < outMs + s.holdMs + inMs -> (t - outMs - s.holdMs) / inMs.toFloat()
+            else -> { s.hideStart = 0L; 1f }
+        }
+    }
+
+    private fun isBusy(s: Slot, now: Long): Boolean =
+        s.hideStart != 0L && now - s.hideStart < outMs + s.holdMs + inMs
+
+    private fun startVanish(s: Slot) {
+        if (!prefs.getBoolean("vanish_enabled", true)) return
+        s.holdMs = prefs.getInt("vanish_ms", 1000).toLong()
+        s.hideStart = SystemClock.uptimeMillis()
+        postInvalidateOnAnimation()
+    }
+
     override fun onDraw(canvas: Canvas) {
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
+        val now = SystemClock.uptimeMillis()
+        var animating = false
         for (s in slots) {
+            val v = visibility(s, now)
+            if (s.hideStart != 0L) animating = true
+            if (v <= 0f) continue
+
             val isPressed = s === pressed
             keyPaint.color = when {
                 isPressed -> cPressed
@@ -113,23 +149,33 @@ class KeyboardView(context: Context) : View(context) {
                 s.key.type == KeyType.CHAR || s.key.type == KeyType.SPACE -> cKey
                 else -> cSpecial
             }
+            keyPaint.alpha = (255 * v).toInt()
+
+            canvas.save()
+            canvas.scale(v, v, s.rect.centerX(), s.rect.centerY())
             canvas.drawRoundRect(s.rect, radius, radius, keyPaint)
 
             val label = labelFor(s.key)
             textPaint.color = if (isPressed) cTextDark else cText
+            textPaint.alpha = (255 * v).toInt()
             textPaint.textSize = (if (s.key.type == KeyType.CHAR) 22f else 15f) * d
             val maxW = s.rect.width() - 8f * d
             val tw = textPaint.measureText(label)
             if (tw > maxW) textPaint.textSize *= maxW / tw
             val y = s.rect.centerY() - (textPaint.descent() + textPaint.ascent()) / 2f
             canvas.drawText(label, s.rect.centerX(), y, textPaint)
+            canvas.restore()
         }
+        if (animating) postInvalidateOnAnimation()
     }
 
     private fun hit(x: Float, y: Float): Slot? {
         val g = gap / 2f
+        val now = SystemClock.uptimeMillis()
         return slots.firstOrNull {
-            x >= it.rect.left - g && x <= it.rect.right + g && y >= it.rect.top - g && y <= it.rect.bottom + g
+            !isBusy(it, now) &&
+                x >= it.rect.left - g && x <= it.rect.right + g &&
+                y >= it.rect.top - g && y <= it.rect.bottom + g
         }
     }
 
@@ -158,7 +204,10 @@ class KeyboardView(context: Context) : View(context) {
                 handler.removeCallbacks(repeatBackspace)
                 val s = pressed
                 pressed = null
-                if (s != null && s.key.type != KeyType.BACKSPACE) perform(s.key)
+                if (s != null) {
+                    if (s.key.type != KeyType.BACKSPACE) perform(s.key)
+                    startVanish(s)
+                }
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
